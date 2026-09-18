@@ -1,9 +1,7 @@
 <#
     VirtualDesktopCycle.ps1
 
-    PROTOTYP: Kiosk-/Wandanzeige-Rundlauf ueber WINDOWS VIRTUELLE DESKTOPS,
-    gesteuert ausschliesslich per HOTKEYS (kein VirtualDesktopAccessor.dll,
-    keine undokumentierte COM-API).
+    PROTOTYP: Kiosk-/Wandanzeige-Rundlauf ueber WINDOWS VIRTUELLE DESKTOPS.
 
     GRUNDIDEE (Unterschied zu AppSupervisorAndBrowserCycle.ps1):
       Bisher wurde bei JEDEM Wechsel erneut SetForegroundWindow/AppActivate +
@@ -13,46 +11,57 @@
 
       Hier bekommt stattdessen JEDES Ziel EINMALIG einen eigenen virtuellen
       Desktop und wird dort einmal in den Vollbildmodus gesetzt. Der Rundlauf
-      besteht danach nur noch aus einem einzigen System-Hotkey
-      (Win+Strg+Pfeil). Der Vollbild- und Fokuszustand bleibt pro Desktop
-      erhalten - es muss also nie wieder Fokus von einem fremden Fenster
-      "gestohlen" werden.
+      besteht danach nur noch aus dem Desktop-Wechsel selbst. Der Vollbild-
+      und Fokuszustand bleibt pro Desktop erhalten - es muss also nie wieder
+      Fokus von einem fremden Fenster "gestohlen" werden.
 
-    WIE FENSTER AUF EINEN DESKTOP KOMMEN:
-      Windows bietet KEINEN Hotkey fuer "Fenster auf Desktop N verschieben"
-      (das geht nur per Maus in der Task-Ansicht oder ueber die inoffizielle
-      COM-API). Der Trick hier: Ein neu gestartetes Programm oeffnet sein
-      Fenster immer auf dem GERADE AKTIVEN Desktop. Das Skript wechselt also
-      erst auf den Zieldesktop und STARTET das Programm dann dort.
+    ZWEI BACKENDS, BEIM START GEPRUEFT:
+      Windows hat keine offiziell zugesicherte API fuer virtuelle Desktops.
+      Es gibt aber das Modul "VirtualDesktop" (MScholtes/PSVirtualDesktop),
+      das die inoffizielle COM-Schnittstelle kapselt und deutlich mehr kann
+      als Tastenkuerzel. Sein Nachteil: Microsoft hat die COM-GUIDs schon
+      mehrfach mit Feature-Updates geaendert (dokumentierte Brueche u.a. bei
+      Win11 21H2->22H2, Build 22581 und 23H2), danach braucht es eine zum
+      Build passende Modulversion.
 
-    BEKANNTE GRENZEN (bitte vor dem Produktiveinsatz testen):
-      1) KEIN WRAP-AROUND: Win+Strg+Rechts am letzten Desktop macht NICHTS
-         (Windows springt nicht zurueck auf Desktop 1). Der Rundlauf ist
-         deshalb als Pendel ("Bounce") bzw. als schneller Ruecklauf
-         ("Rewind") implementiert - siehe cycleMode.
-      2) OPEN LOOP: Der aktuell aktive Desktop laesst sich ohne COM-API nicht
-         auslesen. Das Skript fuehrt daher Buch ueber seine Position. Wenn
-         jemand am Geraet manuell den Desktop wechselt, laeuft die Zaehlung
-         aus dem Tritt. Gegenmittel ist Reset-ToFirstDesktop: Weil es kein
-         Wrap-Around gibt, landet man durch ausreichend viele
-         Win+Strg+Links-Anschlaege garantiert auf Desktop 1.
-      3) BEREITS LAUFENDE PROGRAMME lassen sich per Hotkey NICHT auf einen
-         anderen Desktop verschieben. Ein Programm, das schon laeuft, bleibt
-         auf seinem Desktop. Das Skript erkennt das und protokolliert es;
-         mit "restartForPlacement" kann es das Programm gezielt neu starten.
-      4) SINGLE-INSTANCE-PROGRAMME (z.B. Notepad++ in der Standard-
-         einstellung) oeffnen beim zweiten Aufruf KEIN neues Fenster, sondern
-         holen das bestehende Fenster auf dessen altem Desktop nach vorn.
-         Dafuer gibt es pro Ziel das Feld "Args" (Notepad++: "-multiInst").
-      5) AUSGANGSZUSTAND: Win+Strg+D haengt einen neuen Desktop immer ganz
-         rechts an. Der Layout-Aufbau setzt deshalb voraus, dass beim Start
-         genau EIN virtueller Desktop existiert (Normalzustand nach dem
-         Anmelden). Andernfalls "resetDesktopsOnStart" aktivieren.
-      6) ERHOEHTE PROZESSE: Ob ein nicht-erhoehtes Skript den System-Hotkey
-         ausloesen kann, waehrend ein erhoehtes Fenster im Vordergrund ist,
-         muss auf der Zielmaschine geprueft werden. Im Zweifel dieses Skript
-         ebenfalls als Administrator starten (Task Scheduler: "Mit hoechsten
-         Berechtigungen ausfuehren").
+      Deshalb wird beim Start GEPRUEFT statt geraten: Das Skript versucht das
+      Modul zu laden und einen echten Desktop-Wechsel auszufuehren. Klappt
+      das, laeuft alles ueber das Modul; wirft es einen Fehler, faellt das
+      Skript auf reine Tastenkuerzel zurueck. Ein Versionsbruch faellt damit
+      beim Start auf und nicht mitten im Dauerbetrieb.
+
+      Backend "Module" (bevorzugt):
+        + Absolutes Umschalten auf Desktop N (kein Blaettern, kein Verzaehlen)
+        + Echter Rundlauf inkl. Sprung vom letzten auf den ersten Desktop
+        + Bereits laufende Fenster koennen VERSCHOBEN werden (Move-Window)
+        Installation:  Install-Module VirtualDesktop -Scope AllUsers
+
+      Backend "Hotkey" (Rueckfallebene):
+        - Nur relatives Blaettern mit Win+Strg+Links/Rechts
+        - Kein Wrap-Around: am letzten Desktop passiert bei "Rechts" NICHTS.
+          Der Rundlauf laeuft deshalb als Pendel ("Bounce") oder mit
+          schnellem Ruecklauf ("Rewind") - siehe cycleMode.
+        - Die aktuelle Position ist nicht auslesbar; das Skript fuehrt Buch.
+          Wer am Geraet manuell den Desktop wechselt, bringt die Zaehlung aus
+          dem Tritt. Gegenmittel: Reset-ToFirstDesktop nutzt aus, dass es kein
+          Wrap-Around gibt - genug Anschlaege nach links landen sicher auf
+          Desktop 1.
+        - Laufende Fenster sind NICHT verschiebbar (es gibt dafuer kein
+          Tastenkuerzel). Ziele werden deshalb auf ihrem Desktop GESTARTET.
+
+    WICHTIG - RECHTE:
+      Synthetische Tastendruecke erreichen keine Fenster, die mit hoeheren
+      Rechten laufen als das sendende Skript (UIPI, ein Sicherheitsfeature
+      von Windows). Laeuft HD Witness erhoeht, muss auch dieses Skript
+      erhoeht laufen - im Task Scheduler "Mit hoechsten Berechtigungen
+      ausfuehren". Das betrifft BEIDE Backends, denn F11 fuer den
+      Vollbildmodus ist in jedem Fall ein synthetischer Tastendruck.
+
+    SINGLE-INSTANCE-PROGRAMME (z.B. Notepad++ in der Standardeinstellung)
+      oeffnen beim zweiten Aufruf kein neues Fenster, sondern holen das
+      bestehende nach vorn. Dafuer gibt es pro Ziel das Feld "Args"
+      (Notepad++: "-multiInst"). Mit Backend "Module" ist das meist
+      unnoetig, weil das bestehende Fenster einfach verschoben wird.
 
     Konfiguration: .\config\settings.json, Abschnitt "virtualDesktopCycle".
 
@@ -104,13 +113,14 @@ function New-DefaultVirtualDesktopSettings {
 
     $defaults = [ordered]@{
         virtualDesktopCycle = [ordered]@{
-            intervalSeconds     = 60
-            cycleMode           = "Bounce"
-            fullscreen          = $true
+            desktopBackend       = "Auto"
+            intervalSeconds      = 60
+            cycleMode            = "Bounce"
+            fullscreen           = $true
             resetDesktopsOnStart = $false
-            restartForPlacement = $false
-            maxRuntimeSeconds   = 300
-            targets             = @(
+            restartForPlacement  = $false
+            maxRuntimeSeconds    = 300
+            targets              = @(
                 [ordered]@{
                     Active = $true
                     Type   = "App"
@@ -179,14 +189,28 @@ if ($null -ne $VdConfig.maxRuntimeSeconds) {
 $CycleMode = "Bounce"
 if ($VdConfig.cycleMode -in @('Bounce','Rewind')) { $CycleMode = $VdConfig.cycleMode }
 
-[bool]$UseFullscreen = $true
-try { if ($null -ne $VdConfig.fullscreen) { $UseFullscreen = [System.Convert]::ToBoolean($VdConfig.fullscreen) } } catch { }
+# Auto = Modul probieren, sonst Hotkeys. Module/Hotkey erzwingen ein Backend
+# (nuetzlich, um beide Wege auf der Zielmaschine zu vergleichen).
+$BackendSetting = "Auto"
+if ($VdConfig.desktopBackend -in @('Auto','Module','Hotkey')) { $BackendSetting = $VdConfig.desktopBackend }
 
-[bool]$ResetDesktopsOnStart = $false
-try { if ($null -ne $VdConfig.resetDesktopsOnStart) { $ResetDesktopsOnStart = [System.Convert]::ToBoolean($VdConfig.resetDesktopsOnStart) } } catch { }
+function ConvertTo-BoolSetting {
+    <#
+        Ein blanker [bool]-Cast reicht hier nicht: In JSON landet schnell der
+        STRING "false" statt des Wertes false, und [bool]"false" ist in
+        PowerShell $true (jede nicht-leere Zeichenkette ist wahr). Das wuerde
+        eine Einstellung stillschweigend ins Gegenteil verkehren.
+    #>
+    Param($Value, [bool]$Default)
 
-[bool]$RestartForPlacement = $false
-try { if ($null -ne $VdConfig.restartForPlacement) { $RestartForPlacement = [System.Convert]::ToBoolean($VdConfig.restartForPlacement) } } catch { }
+    if ($null -eq $Value)  { return $Default }
+    if ($Value -is [bool]) { return $Value }
+    try { return [System.Convert]::ToBoolean($Value) } catch { return $Default }
+}
+
+[bool]$UseFullscreen        = ConvertTo-BoolSetting $VdConfig.fullscreen $true
+[bool]$ResetDesktopsOnStart = ConvertTo-BoolSetting $VdConfig.resetDesktopsOnStart $false
+[bool]$RestartForPlacement  = ConvertTo-BoolSetting $VdConfig.restartForPlacement $false
 
 $Targets = @($VdConfig.targets | Where-Object { $_.Active -eq $true })
 
@@ -294,7 +318,7 @@ function Get-ForegroundProcessId {
 }
 
 # ============================================================
-# Virtuelle Desktops (nur Hotkeys)
+# Backend "Hotkey": Desktops per Tastenkuerzel
 # ============================================================
 
 # Die Desktop-Umschaltung ist animiert. Zu kurze Wartezeiten fuehren dazu,
@@ -309,12 +333,6 @@ function Switch-DesktopRight {
 
 function Switch-DesktopLeft {
     Send-WinCtrlHotkey -VirtualKey ([VdInterop]::VK_LEFT) -Extended
-    Start-Sleep -Milliseconds $script:DesktopSwitchDelayMs
-}
-
-function New-VirtualDesktop {
-    <# Win+Strg+D legt einen Desktop am ENDE an und wechselt direkt dorthin. #>
-    Send-WinCtrlHotkey -VirtualKey ([VdInterop]::VK_D)
     Start-Sleep -Milliseconds $script:DesktopSwitchDelayMs
 }
 
@@ -335,22 +353,16 @@ function Reset-ToFirstDesktop {
     }
 }
 
-function Reset-DesktopLayout {
+function Reset-DesktopLayoutByHotkey {
     <#
         Reduziert die Anzahl virtueller Desktops auf genau einen.
 
         Ablauf: ganz nach rechts fahren, dann wiederholt Win+Strg+F4. Windows
         weigert sich, den LETZTEN verbliebenen Desktop zu schliessen - die
         Schleife laeuft also von selbst gegen den Anschlag.
-
-        ACHTUNG: Beim Schliessen eines Desktops wandern dessen Fenster auf den
-        Nachbardesktop; am Ende liegen alle Fenster auf Desktop 1. Programme
-        werden dabei NICHT beendet, aber die Desktop-Aufteilung geht verloren.
-        Deshalb standardmaessig deaktiviert (resetDesktopsOnStart).
     #>
     Param([int]$Steps = 12)
 
-    Write-Log "Baue bestehende virtuelle Desktops ab (resetDesktopsOnStart aktiv)." 'WARN'
     for ($i = 0; $i -lt $Steps; $i++) {
         Switch-DesktopRight
     }
@@ -358,7 +370,162 @@ function Reset-DesktopLayout {
         Send-WinCtrlHotkey -VirtualKey ([VdInterop]::VK_F4)
         Start-Sleep -Milliseconds $script:DesktopSwitchDelayMs
     }
+}
+
+# ============================================================
+# Backend-Auswahl und gemeinsame Schnittstelle
+#
+# Alles darunter spricht nur noch die Wrapper an, nie direkt das Modul oder
+# die Hotkeys. $script:Backend ist danach 'Module' oder 'Hotkey'.
+# ============================================================
+
+$script:Backend = 'Hotkey'
+# Nur im Hotkey-Backend gefuehrt - dort ist die Position nicht auslesbar.
+$script:TrackedPosition = 1
+
+function Initialize-DesktopBackend {
+    <#
+        Prueft das Modul mit genau den Aufrufen, die spaeter auch im Betrieb
+        verwendet werden - Get-DesktopCount und ein echter Switch-Desktop.
+        Ein reiner Import-Test wuerde zu wenig aussagen: Die bekannten
+        Versionsbrueche zeigen sich erst beim COM-Zugriff, nicht beim Laden.
+
+        Der Probe-Wechsel auf Desktop 0 ist kein Nebeneffekt, sondern genau
+        der Ausgangszustand, den der Layout-Aufbau ohnehin braucht.
+    #>
+    Param([Parameter(Mandatory = $true)][String]$Preference)
+
+    if ($Preference -eq 'Hotkey') {
+        Write-Log "Backend 'Hotkey' ist in settings.json fest vorgegeben - das Modul wird nicht geprueft."
+        $script:Backend = 'Hotkey'
+        return
+    }
+
+    try {
+        Import-Module VirtualDesktop -ErrorAction Stop
+
+        $count = Get-DesktopCount -ErrorAction Stop
+        if ($count -lt 1) { throw "Get-DesktopCount lieferte $count." }
+
+        Switch-Desktop -Desktop 0 -ErrorAction Stop
+        Start-Sleep -Milliseconds 300
+
+        $script:Backend = 'Module'
+        Write-Log "Backend 'Module': PowerShell-Modul VirtualDesktop geladen und geprueft ($count Desktop(s) vorhanden)."
+        return
+    }
+    catch {
+        $reason = $_.Exception.Message
+
+        if ($Preference -eq 'Module') {
+            Write-Log "Backend 'Module' war fest vorgegeben, ist aber nicht nutzbar: $reason" 'ERROR'
+            throw "Abbruch: Backend 'Module' erzwungen, aber nicht verfuegbar."
+        }
+
+        Write-Log "Modul VirtualDesktop nicht nutzbar - es wird auf Tastenkuerzel zurueckgefallen. Grund: $reason" 'WARN'
+        Write-Log "Falls das Modul fehlt: 'Install-Module VirtualDesktop -Scope AllUsers'. Falls es nach einem Windows-Feature-Update bricht: passende Modulversion fuer diesen Build installieren." 'WARN'
+        $script:Backend = 'Hotkey'
+    }
+}
+
+function Get-ActualDesktopCount {
+    <# Echte Anzahl - im Hotkey-Backend nicht ermittelbar, daher $null. #>
+    if ($script:Backend -eq 'Module') {
+        try { return [int](Get-DesktopCount -ErrorAction Stop) } catch { return $null }
+    }
+    return $null
+}
+
+function Switch-ToDesktop {
+    <# Wechselt auf den 1-basierten Desktop $Index. #>
+    Param([Parameter(Mandatory = $true)][int]$Index)
+
+    if ($script:Backend -eq 'Module') {
+        Switch-Desktop -Desktop ($Index - 1)
+        Start-Sleep -Milliseconds 300
+        return
+    }
+
+    # Hotkey: nur relativ moeglich - Differenz zur gefuehrten Position laufen.
+    $delta = $Index - $script:TrackedPosition
+    if ($delta -gt 0) { for ($i = 0; $i -lt $delta; $i++)      { Switch-DesktopRight } }
+    elseif ($delta -lt 0) { for ($i = 0; $i -lt -$delta; $i++) { Switch-DesktopLeft } }
+    $script:TrackedPosition = $Index
+}
+
+function Add-DesktopAndSwitch {
+    <# Legt einen Desktop am Ende an und wechselt dorthin. #>
+    if ($script:Backend -eq 'Module') {
+        New-Desktop | Switch-Desktop
+        Start-Sleep -Milliseconds 300
+        return
+    }
+
+    Send-WinCtrlHotkey -VirtualKey ([VdInterop]::VK_D)
+    Start-Sleep -Milliseconds $script:DesktopSwitchDelayMs
+    $script:TrackedPosition++
+}
+
+function Reset-DesktopPosition {
+    <# Stellt sicher, dass Desktop 1 aktiv ist. #>
+    Param([int]$HotkeySteps = 12)
+
+    if ($script:Backend -eq 'Module') {
+        Switch-Desktop -Desktop 0
+        Start-Sleep -Milliseconds 300
+        return
+    }
+
+    Reset-ToFirstDesktop -Steps $HotkeySteps
+    $script:TrackedPosition = 1
+}
+
+function Clear-ExtraDesktops {
+    <#
+        Baut alle Desktops bis auf einen ab.
+
+        ACHTUNG: Beim Schliessen eines Desktops wandern dessen Fenster auf den
+        Nachbardesktop; am Ende liegen alle Fenster auf Desktop 1. Programme
+        werden dabei NICHT beendet, aber die Desktop-Aufteilung geht verloren.
+        Deshalb standardmaessig deaktiviert (resetDesktopsOnStart).
+    #>
+    Param([int]$HotkeySteps = 12)
+
+    Write-Log "Baue bestehende virtuelle Desktops ab (resetDesktopsOnStart aktiv)." 'WARN'
+
+    if ($script:Backend -eq 'Module') {
+        Remove-AllDesktops
+        Start-Sleep -Milliseconds 300
+    }
+    else {
+        Reset-DesktopLayoutByHotkey -Steps $HotkeySteps
+        $script:TrackedPosition = 1
+    }
+
     Write-Log "Desktop-Abbau abgeschlossen - es sollte nur noch Desktop 1 existieren."
+}
+
+function Move-WindowToCurrentDesktop {
+    <#
+        Holt ein bereits laufendes Fenster auf den aktuell aktiven Desktop.
+        Das kann nur das Modul - fuer Tastenkuerzel gibt es dafuer schlicht
+        kein Aequivalent in Windows.
+
+        Rueckgabe: $true, wenn das Fenster verschoben wurde.
+    #>
+    Param([Parameter(Mandatory = $true)][IntPtr]$Handle)
+
+    if ($script:Backend -ne 'Module') { return $false }
+
+    try {
+        $Handle | Move-Window (Get-CurrentDesktop) | Out-Null
+        Start-Sleep -Milliseconds 300
+        return $true
+    }
+    catch {
+        Write-Log "Fenster konnte nicht auf den aktuellen Desktop verschoben werden: $($_.Exception.Message)" 'WARN'
+        return $false
+    }
 }
 
 # ============================================================
@@ -371,6 +538,21 @@ function Get-TargetProcessName {
     if ($Target.Type -eq 'Url') { return 'msedge' }
     if ([string]::IsNullOrWhiteSpace($Target.Path)) { return $null }
     return [System.IO.Path]::GetFileNameWithoutExtension($Target.Path)
+}
+
+function Get-RunningTargetWindow {
+    <# Laufender Prozess des Ziels MIT sichtbarem Fenster, sonst $null. #>
+    Param([Parameter(Mandatory = $true)][Object]$Target)
+
+    $processName = Get-TargetProcessName -Target $Target
+    if (-Not $processName) { return $null }
+
+    # Neuestes Fenster zuerst: Nach dem Start eines Url-Ziels ist genau das
+    # das gerade geoeffnete Edge-Fenster.
+    return Get-Process -Name $processName -ErrorAction SilentlyContinue |
+           Where-Object { $_.MainWindowHandle -ne 0 } |
+           Sort-Object StartTime -Descending |
+           Select-Object -First 1
 }
 
 function Start-TargetOnCurrentDesktop {
@@ -438,35 +620,44 @@ function Start-TargetOnCurrentDesktop {
     # Edge startet gern einen Wrapper-Prozess, der sich sofort beendet und das
     # Fenster einem bestehenden Browser-Prozess uebergibt. Dann liefert der
     # zurueckgegebene Prozess nie ein Fenster - das Fenster existiert aber.
-    $processName = Get-TargetProcessName -Target $Target
-    if ($processName) {
-        $fallback = Get-Process -Name $processName -ErrorAction SilentlyContinue |
-                    Where-Object { $_.MainWindowHandle -ne 0 } |
-                    Sort-Object StartTime -Descending |
-                    Select-Object -First 1
-        if ($fallback) {
-            Write-Log "Ziel '$($Target.Name)': Fenster ueber Prozessnamen '$processName' gefunden (PID $($fallback.Id))."
-            return $fallback
-        }
+    $fallback = Get-RunningTargetWindow -Target $Target
+    if ($fallback) {
+        Write-Log "Ziel '$($Target.Name)': Fenster ueber den Prozessnamen gefunden (PID $($fallback.Id))."
+        return $fallback
     }
 
     Write-Log "Ziel '$($Target.Name)': Innerhalb von $WindowTimeoutSeconds Sekunden ist kein Fenster erschienen." 'WARN'
     return $null
 }
 
-function Test-TargetAlreadyRunning {
-    Param([Parameter(Mandatory = $true)][Object]$Target)
+function Set-TargetFullscreen {
+    Param(
+        [Parameter(Mandatory = $true)][Object]$Process,
+        [Parameter(Mandatory = $true)][String]$Label,
+        [Parameter(Mandatory = $true)][int]$DesktopIndex
+    )
 
-    $processName = Get-TargetProcessName -Target $Target
-    if (-Not $processName) { return $false }
-    return @(Get-Process -Name $processName -ErrorAction SilentlyContinue).Count -gt 0
+    # Das Fenster ist auf diesem Desktop allein und damit bereits im
+    # Vordergrund - es muss also kein Fokus erkaempft werden. Zur Sicherheit
+    # wird das trotzdem geprueft, bevor F11 rausgeht: sonst landet der
+    # Tastendruck im falschen Fenster.
+    Start-Sleep -Seconds 2
+    $foregroundPid = Get-ForegroundProcessId
+
+    if ($foregroundPid -eq $Process.Id) {
+        Send-Fullscreen
+        Write-Log "Ziel '$Label' auf Desktop $DesktopIndex in den Vollbildmodus geschaltet."
+        return
+    }
+
+    Write-Log "Ziel '$Label': Vordergrundfenster gehoert zu PID $foregroundPid, erwartet war PID $($Process.Id). F11 wird NICHT gesendet, um kein fremdes Fenster umzuschalten." 'WARN'
+    Write-Log "Haeufigste Ursache: '$Label' laeuft mit hoeheren Rechten als dieses Skript. Dann muss auch das Skript erhoeht laufen (Task Scheduler: 'Mit hoechsten Berechtigungen ausfuehren')." 'WARN'
 }
 
 function Initialize-DesktopLayout {
     <#
-        Legt pro aktivem Ziel einen virtuellen Desktop an und startet das Ziel
-        dort. Ziel 1 nutzt den bestehenden Desktop 1, jedes weitere Ziel
-        bekommt per Win+Strg+D einen neuen Desktop.
+        Legt pro aktivem Ziel einen virtuellen Desktop an und sorgt dafuer,
+        dass das Ziel dort liegt. Ziel 1 nutzt den bestehenden Desktop 1.
 
         Rueckgabe: Anzahl belegter Desktops.
     #>
@@ -477,24 +668,25 @@ function Initialize-DesktopLayout {
     $resetSteps = [Math]::Max(12, $Targets.Count + 5)
 
     if ($ResetDesktopsOnStart) {
-        # Danach existiert nur noch Desktop 1, man steht also bereits dort -
-        # ein zusaetzliches Reset-ToFirstDesktop waere reine Leerlaufzeit.
-        Reset-DesktopLayout -Steps $resetSteps
+        # Danach existiert nur noch Desktop 1, man steht also bereits dort.
+        Clear-ExtraDesktops -HotkeySteps $resetSteps
     }
     else {
-        # Win+Strg+D haengt den neuen Desktop immer ganz RECHTS an. Existieren
-        # beim Start noch Desktops aus einem frueheren Lauf, liegen die Ziele
-        # danach nicht mehr lueckenlos auf Desktop 1..N und die Zaehlung im
-        # Rundlauf passt nicht mehr zur Realitaet.
-        Write-Log "Hinweis: Der Layout-Aufbau geht davon aus, dass beim Start genau EIN virtueller Desktop existiert (Normalzustand nach dem Anmelden). Sind noch Desktops offen, 'resetDesktopsOnStart' aktivieren." 'WARN'
-        Reset-ToFirstDesktop -Steps $resetSteps
+        if ($script:Backend -eq 'Hotkey') {
+            # Win+Strg+D haengt den neuen Desktop immer ganz RECHTS an.
+            # Existieren beim Start noch Desktops aus einem frueheren Lauf,
+            # liegen die Ziele danach nicht mehr lueckenlos auf Desktop 1..N
+            # und die Zaehlung im Rundlauf passt nicht mehr zur Realitaet.
+            Write-Log "Hinweis: Der Layout-Aufbau geht davon aus, dass beim Start genau EIN virtueller Desktop existiert (Normalzustand nach dem Anmelden). Sind noch Desktops offen, 'resetDesktopsOnStart' aktivieren." 'WARN'
+        }
+        Reset-DesktopPosition -HotkeySteps $resetSteps
     }
 
     $desktopIndex = 0
     foreach ($target in $Targets) {
 
         if ($desktopIndex -gt 0) {
-            New-VirtualDesktop
+            Add-DesktopAndSwitch
         }
         $desktopIndex++
 
@@ -503,40 +695,40 @@ function Initialize-DesktopLayout {
         # Url-Ziele sind ausgenommen: Edge laeuft praktisch immer schon, und
         # ein weiteres Fenster per --new-window ist genau das, was hier
         # gebraucht wird.
-        if ($target.Type -ne 'Url' -and (Test-TargetAlreadyRunning -Target $target)) {
-            if ($RestartForPlacement) {
-                $processName = Get-TargetProcessName -Target $target
-                Write-Log "Ziel '$($target.Name)' laeuft bereits und kann per Hotkey nicht verschoben werden - wird gemaess 'restartForPlacement' beendet und auf Desktop $desktopIndex neu gestartet." 'WARN'
-                Get-Process -Name $processName -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+        $existing = $null
+        if ($target.Type -ne 'Url') {
+            $existing = Get-RunningTargetWindow -Target $target
+        }
+
+        $proc = $null
+
+        if ($existing) {
+            if (Move-WindowToCurrentDesktop -Handle $existing.MainWindowHandle) {
+                Write-Log "Ziel '$($target.Name)' lief bereits (PID $($existing.Id)) und wurde auf Desktop $desktopIndex verschoben - kein Neustart noetig."
+                $proc = $existing
+            }
+            elseif ($RestartForPlacement) {
+                Write-Log "Ziel '$($target.Name)' laeuft bereits und laesst sich nicht verschieben - wird gemaess 'restartForPlacement' beendet und auf Desktop $desktopIndex neu gestartet." 'WARN'
+                Get-Process -Id $existing.Id -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
                 Start-Sleep -Seconds 2
             }
             else {
-                Write-Log "Ziel '$($target.Name)' laeuft bereits. Ein laufendes Fenster laesst sich per Hotkey NICHT auf einen anderen Desktop verschieben - es bleibt auf seinem bisherigen Desktop." 'WARN'
-                Write-Log "Abhilfe: Programm vorher beenden, 'restartForPlacement' aktivieren, oder bei Single-Instance-Programmen 'Args' setzen (Notepad++: -multiInst)." 'WARN'
+                Write-Log "Ziel '$($target.Name)' laeuft bereits und laesst sich mit Backend '$($script:Backend)' nicht verschieben - das bestehende Fenster bleibt auf seinem Desktop, es wird zusaetzlich eine neue Instanz auf Desktop $desktopIndex gestartet." 'WARN'
+                Write-Log "Ohne 'Args' fuer Mehrfachinstanzen holt der Start nur das alte Fenster nach vorn. Abhilfe: Modul VirtualDesktop installieren, 'restartForPlacement' aktivieren, oder 'Args' setzen (Notepad++: -multiInst)." 'WARN'
             }
         }
 
-        $proc = Start-TargetOnCurrentDesktop -Target $target
+        if (-Not $proc) {
+            $proc = Start-TargetOnCurrentDesktop -Target $target
+        }
         if (-Not $proc) { continue }
 
         if ($UseFullscreen) {
-            # Das Fenster ist auf diesem Desktop allein und damit bereits im
-            # Vordergrund - es muss also kein Fokus erkaempft werden. Zur
-            # Sicherheit wird das trotzdem geprueft, bevor F11 rausgeht:
-            # sonst landet der Tastendruck im falschen Fenster.
-            Start-Sleep -Seconds 2
-            $foregroundPid = Get-ForegroundProcessId
-            if ($foregroundPid -eq $proc.Id) {
-                Send-Fullscreen
-                Write-Log "Ziel '$($target.Name)' auf Desktop $desktopIndex in den Vollbildmodus geschaltet."
-            }
-            else {
-                Write-Log "Ziel '$($target.Name)': Vordergrundfenster gehoert zu PID $foregroundPid, erwartet war PID $($proc.Id). F11 wird NICHT gesendet, um kein fremdes Fenster umzuschalten." 'WARN'
-            }
+            Set-TargetFullscreen -Process $proc -Label $target.Name -DesktopIndex $desktopIndex
         }
     }
 
-    Write-Log "Desktop-Layout aufgebaut: $desktopIndex Desktop(s) belegt."
+    Write-Log "Desktop-Layout aufgebaut: $desktopIndex Desktop(s) belegt (Backend '$($script:Backend)')."
     return $desktopIndex
 }
 
@@ -548,12 +740,14 @@ function Invoke-DesktopCycle {
     <#
         Schaltet im Takt von $IntervalSeconds durch die Desktops.
 
-        Weil Windows am letzten Desktop NICHT auf den ersten zurueckspringt,
-        gibt es zwei Modi:
-          Bounce - vor und zurueck (kein Sprung, ruhiges Bild; die mittleren
-                   Desktops sind pro Durchgang zweimal zu sehen)
+        Backend 'Module': echter Rundlauf 1..N..1 per absolutem Wechsel.
+
+        Backend 'Hotkey': Windows springt am letzten Desktop NICHT auf den
+        ersten zurueck, deshalb zwei Ersatzmuster:
+          Bounce - vor und zurueck (ruhiges Bild; die mittleren Desktops sind
+                   pro Durchgang zweimal zu sehen)
           Rewind - vorwaerts bis zum Ende, dann schnell zurueck auf Desktop 1
-                   (gleiche Standzeit fuer alle, dafuer ein kurzes Durchblitzen)
+                   (gleiche Standzeit fuer alle, dafuer kurzes Durchblitzen)
     #>
     Param(
         [Parameter(Mandatory = $true)][int]$DesktopCount,
@@ -578,12 +772,9 @@ function Invoke-DesktopCycle {
         Remove-Item -LiteralPath $StopFile -Force -ErrorAction SilentlyContinue
     }
 
-    if ($MaxRuntimeSeconds -gt 0) {
-        Write-Log "Rundlauf gestartet: $DesktopCount Desktops, Intervall $IntervalSeconds s, Modus $Mode, Laufzeitgrenze $MaxRuntimeSeconds s."
-    }
-    else {
-        Write-Log "Rundlauf gestartet: $DesktopCount Desktops, Intervall $IntervalSeconds s, Modus $Mode, ohne Laufzeitgrenze."
-    }
+    $modeLabel = if ($script:Backend -eq 'Module') { "Rundlauf" } else { $Mode }
+    $limitLabel = if ($MaxRuntimeSeconds -gt 0) { "Laufzeitgrenze $MaxRuntimeSeconds s" } else { "ohne Laufzeitgrenze" }
+    Write-Log "Rundlauf gestartet: $DesktopCount Desktops, Intervall $IntervalSeconds s, Backend '$($script:Backend)', Modus $modeLabel, $limitLabel."
 
     while ($true) {
 
@@ -608,30 +799,31 @@ function Invoke-DesktopCycle {
 
         Start-Sleep -Seconds $sleepSeconds
 
-        if ($Mode -eq 'Bounce') {
+        if ($script:Backend -eq 'Module') {
+            $position = ($position % $DesktopCount) + 1
+            Switch-ToDesktop -Index $position
+        }
+        elseif ($Mode -eq 'Bounce') {
             if ($position -ge $DesktopCount) { $direction = -1 }
             elseif ($position -le 1)         { $direction = 1 }
 
-            if ($direction -eq 1) { Switch-DesktopRight; $position++ }
-            else                  { Switch-DesktopLeft;  $position-- }
+            if ($direction -eq 1) { $position++ } else { $position-- }
+            Switch-ToDesktop -Index $position
         }
         else {
             if ($position -ge $DesktopCount) {
-                # Zurueck auf Desktop 1. Bewusst ohne Standzeit, damit die
-                # uebersprungenen Desktops nicht als vollwertige Station
-                # erscheinen.
-                for ($i = 0; $i -lt ($DesktopCount - 1); $i++) {
-                    Switch-DesktopLeft
-                }
+                # Zurueck auf Desktop 1. Switch-ToDesktop laeuft die Differenz
+                # ohne Standzeit ab, damit die uebersprungenen Desktops nicht
+                # als vollwertige Station erscheinen.
                 $position = 1
             }
             else {
-                Switch-DesktopRight
                 $position++
             }
+            Switch-ToDesktop -Index $position
         }
 
-        Write-Log "Aktive Desktop-Position laut Zaehlung: $position von $DesktopCount."
+        Write-Log "Aktiver Desktop: $position von $DesktopCount."
     }
 
     Write-Log "Rundlauf beendet nach $([Math]::Round(((Get-Date) - $startTime).TotalSeconds, 1)) Sekunden."
@@ -648,10 +840,17 @@ if ($Targets.Count -eq 0) {
 
 Write-Log "VirtualDesktopCycle startet mit $($Targets.Count) aktiven Ziel(en)."
 
+Initialize-DesktopBackend -Preference $BackendSetting
+
 if ($CycleOnly) {
-    Reset-ToFirstDesktop -Steps ([Math]::Max(12, $Targets.Count + 5))
-    $desktopCount = $Targets.Count
-    Write-Log "CycleOnly: Layout wird nicht neu aufgebaut, es werden $desktopCount bestehende Desktops angenommen."
+    Reset-DesktopPosition -HotkeySteps ([Math]::Max(12, $Targets.Count + 5))
+
+    # Mit Modul ist die echte Anzahl bekannt; per Hotkey bleibt nur die
+    # Annahme "ein Desktop je Ziel" aus dem vorherigen Lauf.
+    $desktopCount = Get-ActualDesktopCount
+    if (-Not $desktopCount) { $desktopCount = $Targets.Count }
+
+    Write-Log "CycleOnly: Layout wird nicht neu aufgebaut, es wird mit $desktopCount Desktop(s) gearbeitet."
 }
 else {
     $desktopCount = Initialize-DesktopLayout -Targets $Targets
