@@ -55,6 +55,11 @@
          Berechtigungen ausfuehren").
 
     Konfiguration: .\config\settings.json, Abschnitt "virtualDesktopCycle".
+
+    STOPPEN: Mit maxRuntimeSeconds = 0 laeuft der Rundlauf endlos. Zum
+    geordneten Beenden eine Datei "stop.txt" neben das Skript legen - sie wird
+    beim naechsten Taktwechsel erkannt (also nach spaetestens
+    intervalSeconds), verarbeitet und wieder geloescht.
 #>
 
 [CmdletBinding()]
@@ -140,7 +145,10 @@ function New-DefaultVirtualDesktopSettings {
 if (-Not (Test-Path $ConfigPath)) {
     New-DefaultVirtualDesktopSettings -Path $ConfigPath
     Write-Log "Keine settings.json gefunden - Standardkonfiguration wurde erstellt: $ConfigPath"
-    Write-Log "Bitte Pfade und URLs anpassen, danach erneut starten." 'WARN'
+    # Hier wird bewusst abgebrochen: Mit der Vorlage wuerde das Skript
+    # Desktops anlegen und https://example.com oeffnen.
+    Write-Log "Bitte Pfade und URLs anpassen und danach erneut starten." 'WARN'
+    return
 }
 
 try {
@@ -159,7 +167,7 @@ if (-Not $VdConfig) {
 }
 
 [int]$IntervalSeconds = 60
-if ($VdConfig.intervalSeconds -and [int]$VdConfig.intervalSeconds -gt 0) {
+if ([int]$VdConfig.intervalSeconds -gt 0) {
     $IntervalSeconds = [int]$VdConfig.intervalSeconds
 }
 
@@ -234,10 +242,14 @@ function Send-Key {
 
 function Reset-ModifierKeys {
     <#
-        Gibt Win und Strg zwangsweise frei. Ein haengengebliebener
-        Modifier waere im unbeaufsichtigten Dauerbetrieb besonders
-        unangenehm (Startmenue oeffnet sich, Tastatur reagiert scheinbar
-        nicht mehr), deshalb laeuft das nach jedem Hotkey im finally-Zweig.
+        Regulaerer Loslass-Schritt jedes Hotkeys - Send-WinCtrlHotkey drueckt
+        die Modifier nur und gibt sie hier wieder frei.
+
+        Der Aufruf steht im finally-Zweig, damit die Modifier auch bei einem
+        Abbruch mitten in der Tastenfolge losgelassen werden: Eine
+        haengengebliebene Windows-Taste waere im unbeaufsichtigten Betrieb
+        besonders unangenehm (Startmenue oeffnet sich, Tastatur reagiert
+        scheinbar nicht mehr).
     #>
     Send-Key -VirtualKey ([VdInterop]::VK_CONTROL) -KeyUp
     Send-Key -VirtualKey ([VdInterop]::VK_LWIN) -KeyUp
@@ -319,10 +331,8 @@ function Reset-ToFirstDesktop {
 
     Write-Log "Setze Desktop-Position zurueck auf Desktop 1 ($Steps x Win+Strg+Links)."
     for ($i = 0; $i -lt $Steps; $i++) {
-        Send-WinCtrlHotkey -VirtualKey ([VdInterop]::VK_LEFT) -Extended
-        Start-Sleep -Milliseconds 250
+        Switch-DesktopLeft
     }
-    Start-Sleep -Milliseconds $script:DesktopSwitchDelayMs
 }
 
 function Reset-DesktopLayout {
@@ -342,14 +352,12 @@ function Reset-DesktopLayout {
 
     Write-Log "Baue bestehende virtuelle Desktops ab (resetDesktopsOnStart aktiv)." 'WARN'
     for ($i = 0; $i -lt $Steps; $i++) {
-        Send-WinCtrlHotkey -VirtualKey ([VdInterop]::VK_RIGHT) -Extended
-        Start-Sleep -Milliseconds 250
+        Switch-DesktopRight
     }
     for ($i = 0; $i -lt $Steps; $i++) {
         Send-WinCtrlHotkey -VirtualKey ([VdInterop]::VK_F4)
-        Start-Sleep -Milliseconds 400
+        Start-Sleep -Milliseconds $script:DesktopSwitchDelayMs
     }
-    Start-Sleep -Milliseconds $script:DesktopSwitchDelayMs
     Write-Log "Desktop-Abbau abgeschlossen - es sollte nur noch Desktop 1 existieren."
 }
 
@@ -469,6 +477,8 @@ function Initialize-DesktopLayout {
     $resetSteps = [Math]::Max(12, $Targets.Count + 5)
 
     if ($ResetDesktopsOnStart) {
+        # Danach existiert nur noch Desktop 1, man steht also bereits dort -
+        # ein zusaetzliches Reset-ToFirstDesktop waere reine Leerlaufzeit.
         Reset-DesktopLayout -Steps $resetSteps
     }
     else {
@@ -477,9 +487,8 @@ function Initialize-DesktopLayout {
         # danach nicht mehr lueckenlos auf Desktop 1..N und die Zaehlung im
         # Rundlauf passt nicht mehr zur Realitaet.
         Write-Log "Hinweis: Der Layout-Aufbau geht davon aus, dass beim Start genau EIN virtueller Desktop existiert (Normalzustand nach dem Anmelden). Sind noch Desktops offen, 'resetDesktopsOnStart' aktivieren." 'WARN'
+        Reset-ToFirstDesktop -Steps $resetSteps
     }
-
-    Reset-ToFirstDesktop -Steps $resetSteps
 
     $desktopIndex = 0
     foreach ($target in $Targets) {
@@ -491,7 +500,10 @@ function Initialize-DesktopLayout {
 
         Write-Log "Desktop $desktopIndex : richte Ziel '$($target.Name)' ein."
 
-        if ((Test-TargetAlreadyRunning -Target $target) -and $target.Type -ne 'Url') {
+        # Url-Ziele sind ausgenommen: Edge laeuft praktisch immer schon, und
+        # ein weiteres Fenster per --new-window ist genau das, was hier
+        # gebraucht wird.
+        if ($target.Type -ne 'Url' -and (Test-TargetAlreadyRunning -Target $target)) {
             if ($RestartForPlacement) {
                 $processName = Get-TargetProcessName -Target $target
                 Write-Log "Ziel '$($target.Name)' laeuft bereits und kann per Hotkey nicht verschoben werden - wird gemaess 'restartForPlacement' beendet und auf Desktop $desktopIndex neu gestartet." 'WARN'
@@ -557,7 +569,14 @@ function Invoke-DesktopCycle {
 
     $startTime = Get-Date
     $position  = 1
-    $direction = 1
+
+    # Notbremse fuer den unbeaufsichtigten Betrieb: Mit maxRuntimeSeconds = 0
+    # laeuft der Rundlauf endlos. Ohne diese Datei bliebe nur, den Prozess
+    # abzuschiessen - auf einer Wandanzeige ohne Tastatur keine Option.
+    $StopFile = Join-Path $PSScriptRoot "stop.txt"
+    if (Test-Path -LiteralPath $StopFile) {
+        Remove-Item -LiteralPath $StopFile -Force -ErrorAction SilentlyContinue
+    }
 
     if ($MaxRuntimeSeconds -gt 0) {
         Write-Log "Rundlauf gestartet: $DesktopCount Desktops, Intervall $IntervalSeconds s, Modus $Mode, Laufzeitgrenze $MaxRuntimeSeconds s."
@@ -567,6 +586,12 @@ function Invoke-DesktopCycle {
     }
 
     while ($true) {
+
+        if (Test-Path -LiteralPath $StopFile) {
+            Write-Log "Stopp-Datei '$StopFile' gefunden - Rundlauf wird beendet."
+            Remove-Item -LiteralPath $StopFile -Force -ErrorAction SilentlyContinue
+            break
+        }
 
         $elapsed = ((Get-Date) - $startTime).TotalSeconds
         if ($MaxRuntimeSeconds -gt 0 -and $elapsed -ge $MaxRuntimeSeconds) {
