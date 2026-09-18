@@ -265,16 +265,18 @@ if ($Settings.monitoredApps) {
 # Deshalb wird das komplett abgefangen und das Script laeuft ohne EventLog weiter.
 $script:EventLogAvailable = $false
 try {
-    if (-Not [System.Diagnostics.EventLog]::SourceExists("sdr-supervisor")) {
+    if ([System.Diagnostics.EventLog]::SourceExists("sdr-supervisor")) {
+        $script:EventLogAvailable = $true
+    }
+    else {
         try {
             [System.Diagnostics.EventLog]::CreateEventSource("sdr-supervisor", "Application")
+            $script:EventLogAvailable = $true
         }
         catch {
             Write-Log "Windows Event Log Quelle konnte nicht angelegt werden (keine Adminrechte): $($_.Exception.Message)" 'WARN'
         }
     }
-    # Wenn SourceExists nicht geworfen hat, koennen wir spaeter zumindest versuchen zu schreiben.
-    $script:EventLogAvailable = $true
 }
 catch {
     Write-Log "Windows Event Log nicht nutzbar (SecurityException/keine Rechte): $($_.Exception.Message)" 'WARN'
@@ -654,9 +656,13 @@ function OpenUrlAndLogin {
         Write-Host $Name 'Check for Unsafe' $ThisIsUnsafe;
         if ($ThisIsUnsafe) {
             ThisIsUnsafe -Ps $ps
-            #Check ps Id and replace in needed
+            # Nach dem Ueberspringen der Warnung aendert sich der Fenstertitel,
+            # das Fenster wird deshalb neu gesucht - aber nur uebernommen, wenn
+            # es auch gefunden wurde. Vorher stand hier der Selbstvergleich
+            # $ps.Id -eq $ps.Id, der immer wahr war und $ps damit auch mit
+            # $null ueberschrieben hat, wenn die Suche nichts fand.
             $ps2 = Get-Process msedge -ErrorAction SilentlyContinue | Where-Object MainWindowTitle -like $TabNameLogin
-            if ( $ps.Id -eq $ps.Id) {
+            if ($ps2 -and $ps2.Id) {
                 $ps = $ps2
             }
         }
@@ -665,9 +671,10 @@ function OpenUrlAndLogin {
         Write-Host $Name 'Check for Login' $Login;
         if ($Login) {
             Login -Name $Name -Ps $ps -Username $Username -Pw $Pw
-            #Check ps Id and replace in needed
+            # Wie oben: nach dem Login traegt das Fenster den Zieltitel. Neu
+            # suchen, aber nur bei Treffer uebernehmen.
             $ps2 = Get-Process msedge -ErrorAction SilentlyContinue | Where-Object MainWindowTitle -like $TabName
-            if ( $ps.Id -eq $ps.Id) {
+            if ($ps2 -and $ps2.Id) {
                 $ps = $ps2
             }
         }
@@ -766,47 +773,94 @@ public class ApiDef
     return ($ps)
 }
 
+function Invoke-AppActivate {
+    <#
+        Aktiviert ein Fenster ueber WScript.Shell mit BEGRENZTER Anzahl
+        Versuche und meldet Erfolg oder Misserfolg zurueck.
+
+        Vorher warteten ThisIsUnsafe und Login jeweils in einer Schleife OHNE
+        Abbruchbedingung darauf, dass AppActivate einmal $true liefert. Genau
+        dieser Fall tritt aber nie ein, wenn das Zielfenster mit hoeheren
+        Rechten laeuft als dieses Skript (UIPI/Focus-Stealing-Schutz) - das
+        Skript blieb dann dauerhaft haengen, ohne jeden Logeintrag. Die
+        Begrenzung entspricht dem Muster, das Open-UrlInExistingWindow und
+        Set-WindowFullscreen im selben Skript schon verwenden.
+    #>
+    Param(
+        [Parameter(Mandatory = $true)]
+        [Object]$Wshell,
+        [Parameter(Mandatory = $true)]
+        [AllowNull()]
+        [Object]$Ps,
+        [int]$MaxTries = 10
+    )
+
+    if (-Not $Ps -or -Not $Ps.Id) {
+        Write-Log "Fensteraktivierung nicht moeglich: kein gueltiger Prozess uebergeben." 'WARN'
+        return $false
+    }
+
+    for ($try = 0; $try -lt $MaxTries; $try++) {
+        if ($Wshell.AppActivate($Ps.Id)) {
+            return $true
+        }
+        Start-Sleep -MilliSeconds 300
+    }
+
+    Write-Log "Fenster (PID $($Ps.Id)) konnte in $MaxTries Versuchen nicht aktiviert werden. Moegliche Ursache: Das Zielprogramm laeuft mit hoeheren Rechten als dieses Skript." 'WARN'
+    return $false
+}
+
+function ConvertTo-SendKeysLiteral {
+    <#
+        SendKeys deutet + ^ % ~ ( ) { } [ ] als Steuerzeichen. Ein Passwort
+        oder Benutzername mit einem dieser Zeichen wuerde sonst verstuemmelt
+        oder als Tastenkombination interpretiert (aus "a+b" wird z.B. ein
+        Shift-Druck). Geschweifte Klammern um das Sonderzeichen machen es
+        wieder zu einem Literal.
+    #>
+    Param(
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyString()]
+        [String]$Text
+    )
+
+    $builder = New-Object System.Text.StringBuilder
+    foreach ($char in $Text.ToCharArray()) {
+        if ('+^%~(){}[]'.Contains($char)) {
+            [void]$builder.Append('{').Append($char).Append('}')
+        }
+        else {
+            [void]$builder.Append($char)
+        }
+    }
+    return $builder.ToString()
+}
+
 function ThisIsUnsafe {
     Param(
         [Parameter(Mandatory = $true)]
         [Object]$ps
     )
 
-    $wshellThisIsUnsafe = $null
     $wshellThisIsUnsafe = New-Object -ComObject wscript.shell
-    while (-not $wshellThisIsUnsafe.AppActivate($ps.Id)) {
-        Start-Sleep -MilliSeconds 300
+
+    if (-Not (Invoke-AppActivate -Wshell $wshellThisIsUnsafe -Ps $ps)) {
+        Write-Log "Zertifikatswarnung konnte nicht uebersprungen werden - das Fenster liess sich nicht aktivieren." 'WARN'
+        return
     }
 
-    Write-Host 'ThisIsUnsafe for Object' $ps.MainWindowTitle
+    Write-Log "Ueberspringe Zertifikatswarnung im Fenster '$($ps.MainWindowTitle)' (Eingabe 'thisisunsafe')."
 
-    if ($ps.Id -eq $null) {
-        Start-Sleep -Seconds 1
-        $wshellThisIsUnsafe.SendKeys('t')
-        Start-Sleep -MilliSeconds 100
-        $wshellThisIsUnsafe.SendKeys('h')
-        Start-Sleep -MilliSeconds 100
-        $wshellThisIsUnsafe.SendKeys('i')
-        Start-Sleep -MilliSeconds 100
-        $wshellThisIsUnsafe.SendKeys('s')
-        Start-Sleep -MilliSeconds 100
-
-        $wshellThisIsUnsafe.SendKeys('i')
-        Start-Sleep -MilliSeconds 100
-        $wshellThisIsUnsafe.SendKeys('s')
-        Start-Sleep -MilliSeconds 100
-
-        $wshellThisIsUnsafe.SendKeys('u')
-        Start-Sleep -MilliSeconds 100
-        $wshellThisIsUnsafe.SendKeys('n')
-        Start-Sleep -MilliSeconds 100
-        $wshellThisIsUnsafe.SendKeys('s')
-        Start-Sleep -MilliSeconds 100
-        $wshellThisIsUnsafe.SendKeys('a')
-        Start-Sleep -MilliSeconds 100
-        $wshellThisIsUnsafe.SendKeys('f')
-        Start-Sleep -MilliSeconds 100
-        $wshellThisIsUnsafe.SendKeys('e')
+    # Zeichenweise mit kurzer Pause: Die Interstitial-Seite wertet die
+    # Tastenfolge einzeln aus, zu schnelles Tippen laesst Zeichen verloren
+    # gehen. Der Block stand vorher in einem if ($ps.Id -eq $null) - eine
+    # Bedingung, die an dieser Stelle nie zutreffen kann, weil die
+    # Aktivierung darueber bereits eine gueltige PID braucht. Die Eingabe
+    # wurde damit nie ausgefuehrt.
+    Start-Sleep -Seconds 1
+    foreach ($char in 'thisisunsafe'.ToCharArray()) {
+        $wshellThisIsUnsafe.SendKeys($char)
         Start-Sleep -MilliSeconds 100
     }
 }
@@ -822,14 +876,19 @@ function Login {
         [Parameter(Mandatory = $true)]
         [Object]$Pw
     )
-    Write-Host 'Login for Object ' $ps.MainWindowTitle
+    Write-Log "Login fuer '$Name' im Fenster '$($ps.MainWindowTitle)'."
 
     Start-Sleep -Seconds 1
-    $wshellLogin = $null
     $wshellLogin = New-Object -ComObject wscript.shell
-    while (-not $wshellLogin.AppActivate($ps.Id)) {
-        Start-Sleep -MilliSeconds 300
+
+    # Abbruch statt Weitermachen: Ohne aktiviertes Zielfenster wuerden die
+    # folgenden SendKeys die Zugangsdaten in irgendein anderes gerade aktives
+    # Fenster tippen - im Zweifel in eine Suchleiste oder einen Chat.
+    if (-Not (Invoke-AppActivate -Wshell $wshellLogin -Ps $ps)) {
+        Write-Log "Login fuer '$Name' wird ABGEBROCHEN: Das Zielfenster liess sich nicht aktivieren. Es werden bewusst keine Zugangsdaten gesendet, damit sie nicht in einem fremden Fenster landen." 'WARN'
+        return
     }
+
     #Special handling based on Name
     switch -wildcard ($Name) {
         "Baader*" {
@@ -840,11 +899,11 @@ function Login {
 
     #Login
     Start-Sleep -Seconds 1
-    $wshellLogin.SendKeys($username)
+    $wshellLogin.SendKeys((ConvertTo-SendKeysLiteral -Text $Username))
     Start-Sleep -Seconds 1
     $wshellLogin.SendKeys('{TAB}')
     Start-Sleep -Seconds 1
-    $wshellLogin.SendKeys($pw)
+    $wshellLogin.SendKeys((ConvertTo-SendKeysLiteral -Text $Pw))
     Start-Sleep -Seconds 1
     $wshellLogin.SendKeys('{ENTER}')
     Start-Sleep -Seconds 1
@@ -859,23 +918,55 @@ function CicleTabs {
         [Parameter(Mandatory = $true)]
         [int]$wait
     )
+    <#
+        Schaltet reihum durch die geoeffneten Tabs.
+
+        $pss enthaelt je konfiguriertem Tab einen Prozessverweis. Weil alle
+        Tabs bewusst in EINEM Edge-Fenster liegen (siehe
+        Assert-SingleBrowserWindow), zeigen diese Eintraege aber auf dasselbe
+        Fenster. Das bisherige SetForegroundWindow je Eintrag holte also
+        immer wieder dasselbe, ohnehin aktive Fenster nach vorn und wechselte
+        keinen einzigen Tab - der Rundlauf zeigte ein Standbild.
+
+        Ein Tabwechsel braucht einen echten Tastendruck: Strg+Tab.
+    #>
     if (-Not ([System.Management.Automation.PSTypeName]'Program').Type) {
         Add-Type "using System;using System.Runtime.InteropServices;public class Program {[DllImport(`"user32.dll`")][return: MarshalAs(UnmanagedType.Bool)]public static extern bool SetForegroundWindow(IntPtr hWnd);}"
     }
 
+    $window = @($pss | Where-Object { $_ -ne $null -and $_.MainWindowHandle -ne 0 }) | Select-Object -First 1
+    if (-Not $window) {
+        Write-Log "Tab-Rundlauf: Kein Browserfenster mit gueltigem Fensterhandle vorhanden - Rundlauf wird uebersprungen." 'WARN'
+        return
+    }
+
+    $tabCount = @($pss | Where-Object { $_ -ne $null }).Count
+    if ($tabCount -le 1) {
+        Write-Log "Tab-Rundlauf: Nur $tabCount Tab(s) referenziert - es gibt nichts durchzuschalten." 'WARN'
+        return
+    }
+
+    Write-Log "Tab-Rundlauf gestartet: $tabCount Tabs im Fenster PID $($window.Id), $repeater Durchgaenge, $wait Sekunden je Tab."
+
+    $wshellCycle = New-Object -ComObject wscript.shell
+
     for ($i = 0; $i -lt $repeater; $i++) {
-        foreach ($ps in $pss) {
-            if ($ps -ne $null) {
-                [Program]::SetForegroundWindow($ps.MainWindowHandle) | out-null
-                Start-Sleep -Seconds $wait
+        for ($t = 0; $t -lt $tabCount; $t++) {
+
+            # Vor jedem Wechsel neu aktivieren: Uebernimmt zwischendurch ein
+            # anderes Fenster den Fokus, ginge Strg+Tab sonst dorthin.
+            [Program]::SetForegroundWindow($window.MainWindowHandle) | Out-Null
+            if (-Not (Invoke-AppActivate -Wshell $wshellCycle -Ps $window)) {
+                Write-Log "Tab-Rundlauf abgebrochen: Das Browserfenster liess sich nicht mehr aktivieren." 'WARN'
+                return
             }
+
+            $wshellCycle.SendKeys('^{TAB}')
+            Start-Sleep -Seconds $wait
         }
     }
-}
 
-function RestartScript {
-    Get-Process | Where-Object { $_.ProcessName -eq 'msedge' } | Stop-Process -Force
-    Start-Sleep -Seconds 1
+    Write-Log "Tab-Rundlauf beendet nach $repeater Durchgang/Durchgaengen."
 }
 
 # ============================================================
@@ -1152,15 +1243,17 @@ function Invoke-BrowserCycle {
         # ------------------------------------------------------------
         Invoke-FullscreenCycle -BrowserWindows $pss -MonitoredApps $MonitoredApps -IntervalSeconds $FullscreenCycleIntervalSeconds
 
-        #live
-        #Berechnung der Wiederholungen anhand der Sekunden pro 59 Min und Wartezeit
+        # Berechnung der Wiederholungen anhand der Sekunden pro 59 Min und
+        # Wartezeit. Die 3540 setzen voraus, dass der Task Scheduler dieses
+        # Skript stuendlich neu startet.
         $repeater = [int](3540 / $wait / $CountActive)
+        if ($repeater -lt 1) {
+            # Bei grossen waitSeconds ergibt die Ganzzahldivision 0 - der
+            # Rundlauf haette dann stillschweigend gar nicht stattgefunden.
+            Write-Log "Berechnete Durchgaenge waren $repeater (waitSeconds=$wait, aktive Tabs=$CountActive). Es wird mindestens ein Durchgang ausgefuehrt; fuer die volle Stunde muss waitSeconds kleiner sein." 'WARN'
+            $repeater = 1
+        }
         CicleTabs -pss $pss -repeater $repeater -wait $wait
-
-        #for Testing
-        #CicleTabs -pss $pss -repeater 2 -wait 2
-
-        #RestartScript
     }
 }
 
