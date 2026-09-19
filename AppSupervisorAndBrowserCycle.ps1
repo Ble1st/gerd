@@ -35,11 +35,22 @@
          Jetzt wird per GetForegroundWindow ECHT verifiziert, ob das Zielfenster im
          Vordergrund ist; F11 wird nur bei bestaetigtem Erfolg gesendet, sonst gibt
          es eine klare WARN-Meldung inkl. Hinweis auf ggf. fehlende Admin-Rechte.
-         SICHERHEITS-HARDSTOP: Zur Absicherung ist der komplette Vollbild-Rundlauf
-         aktuell hart auf maximal 2 Minuten Gesamtlaufzeit begrenzt (Konstante
-         $HardStopFullscreenCycleSeconds), UNABHAENGIG von der Konfiguration. Das
-         verhindert, dass der Vollbild-Wechsel bei Fehlkonfiguration endlos/zu lange
-         laeuft, bevor es im produktiven Dauerbetrieb final freigegeben wird.
+         SICHERHEITS-HARDSTOP: Der Vollbild-Rundlauf ist in der Gesamtlaufzeit
+         begrenzt (timings.fullscreenHardStopSeconds, Standard 120 Sekunden,
+         0 = keine Begrenzung). Das verhindert, dass der Vollbild-Wechsel bei
+         Fehlkonfiguration endlos laeuft.
+
+    ZUGANGSDATEN:
+      Passwoerter gehoeren NICHT mehr in settings.json. Sie werden ueber die
+      Windows-Datenschutz-API (DPAPI) verschluesselt unter
+      .\state\credentials abgelegt:
+
+          .\AppSupervisorAndBrowserCycle.ps1 -SetCredential "<Tab-Name>"
+
+      Die Datei ist an dieses Benutzerkonto auf diesem Rechner gebunden, muss
+      also auf dem Kiosk unter dem Konto erzeugt werden, das spaeter auch das
+      Skript ausfuehrt. Ein noch vorhandenes Klartext-"Pw" wird uebergangs-
+      weise weiter akzeptiert, aber bei jedem Lauf angemahnt.
 
     Konfiguration liegt in:
         .\config\settings.json
@@ -50,10 +61,27 @@
         { "Name": "Notepad++", "Path": "C:\\Program Files\\Notepad++\\notepad++.exe" },
         { "Name": "HD Witness", "Path": "C:\\Program Files\\Network Optix\\Nx Witness\\Client\\6.1.2.42921\\HD Witness.exe" }
       ],
+      "timings": {
+        "cycleWindowSeconds": 3540,
+        "fullscreenHardStopSeconds": 120,
+        "logRetentionDays": 30
+      },
+      "kioskSetup": {
+        "taskIntervalMinutes": 5,
+        "nightlyRebootTime": "04:30"
+      },
       "browserCycle": {
         "waitSeconds": 30,
         "closeExtraBrowserWindows": true,
         "fullscreenCycleIntervalSeconds": 60,
+        "browserArguments": [
+          "--noerrdialogs",
+          "--disable-session-crashed-bubble",
+          "--no-first-run",
+          "--no-default-browser-check",
+          "--disable-infobars",
+          "--lang=de-DE"
+        ],
         "tabs": [
           {
             "Active": true,
@@ -64,13 +92,26 @@
             "TabNameUnsafe": "",
             "Login": false,
             "TabNameLogin": "",
-            "Username": "",
-            "Pw": ""
+            "Username": ""
           }
         ]
       }
     }
+
+    ZEITEN (Abschnitt "timings"):
+      cycleWindowSeconds         Zeitfenster eines Laufs. 3540 = 59 Minuten und
+                                 setzt einen stuendlichen Trigger voraus. Wird
+                                 der Task oefter gestartet, entsprechend senken.
+      fullscreenHardStopSeconds  Obergrenze des Vollbild-Rundlaufs, 0 = keine.
+      logRetentionDays           Aufbewahrung der Logdateien, 0 = nie loeschen.
 #>
+
+[CmdletBinding()]
+Param(
+    # Speichert die Zugangsdaten fuer den angegebenen Tab-Namen verschluesselt
+    # ab und beendet sich danach. Siehe Set-TabCredential.
+    [String]$SetCredential
+)
 
 # ============================================================
 # Konfiguration laden (Unterordner + settings.json werden beim
@@ -89,6 +130,37 @@ if (-Not (Test-Path $LogDir)) {
 }
 $LogFile = Join-Path $LogDir ("AppSupervisorAndBrowserCycle_" + (Get-Date -Format "yyyyMMdd") + ".log")
 
+function Remove-OldLogs {
+    <#
+        Loescht Logdateien, die aelter als $RetentionDays sind.
+
+        Das Skript legt pro Tag eine Datei an und hat sie bisher nie wieder
+        angefasst - auf einem Geraet im 24/7-Dauerbetrieb sammeln sich die
+        ueber Jahre an.  RetentionDays = 0 schaltet das Aufraeumen ab.
+    #>
+    Param(
+        [Parameter(Mandatory = $true)]
+        [int]$RetentionDays
+    )
+
+    if ($RetentionDays -le 0) { return }
+
+    $limit = (Get-Date).AddDays(-$RetentionDays)
+    try {
+        $old = @(Get-ChildItem -Path $LogDir -Filter "AppSupervisorAndBrowserCycle_*.log" -File -ErrorAction Stop |
+                 Where-Object { $_.LastWriteTime -lt $limit })
+        foreach ($file in $old) {
+            Remove-Item -LiteralPath $file.FullName -Force -ErrorAction SilentlyContinue
+        }
+        if ($old.Count -gt 0) {
+            Write-Log "Log-Aufraeumen: $($old.Count) Datei(en) aelter als $RetentionDays Tage entfernt."
+        }
+    }
+    catch {
+        Write-Log "Log-Aufraeumen fehlgeschlagen: $($_.Exception.Message)" 'WARN'
+    }
+}
+
 # ============================================================
 # Persistenter State fuer bereits geoeffnete Browser-Tabs
 # (verhindert doppelte Tabs, wenn der Fenstertitel-Match wegen
@@ -101,6 +173,97 @@ if (-Not (Test-Path $StateDir)) {
     New-Item -ItemType Directory -Path $StateDir -Force | Out-Null
 }
 $OpenedTabsStateFile = Join-Path $StateDir "opened_tabs.json"
+
+# ============================================================
+# Zugangsdaten (DPAPI-verschluesselt, .\state\credentials)
+#
+# Passwoerter standen bisher im Klartext in settings.json. Export-Clixml
+# verschluesselt den SecureString ueber die Windows-Datenschutz-API (DPAPI).
+# WICHTIG: Die Datei ist damit an DIESEN Benutzer auf DIESER Maschine
+# gebunden - sie muss also auf dem Kiosk unter genau dem Konto erzeugt
+# werden, das spaeter auch das Skript ausfuehrt (bei Auto-Logon eben jenes).
+# Kopieren auf ein anderes Geraet funktioniert absichtlich nicht.
+#
+# Anlegen:  .\AppSupervisorAndBrowserCycle.ps1 -SetCredential "<Tab-Name>"
+# ============================================================
+$CredentialDir = Join-Path $StateDir "credentials"
+
+function Get-CredentialPath {
+    Param(
+        [Parameter(Mandatory = $true)]
+        [String]$Name
+    )
+    # Tab-Namen duerfen Leer- und Sonderzeichen enthalten, Dateinamen nicht.
+    $safe = ($Name.ToCharArray() | ForEach-Object {
+        if ([System.IO.Path]::GetInvalidFileNameChars() -contains $_) { '_' } else { $_ }
+    }) -join ''
+    return (Join-Path $CredentialDir "$safe.cred.xml")
+}
+
+function Set-TabCredential {
+    <#
+        Fragt Benutzername und Passwort interaktiv ab und legt sie
+        DPAPI-verschluesselt ab. Bewusst interaktiv: So landet das Passwort
+        weder in der Kommandozeile noch in der PowerShell-Historie.
+    #>
+    Param(
+        [Parameter(Mandatory = $true)]
+        [String]$Name
+    )
+
+    if (-Not (Test-Path $CredentialDir)) {
+        New-Item -ItemType Directory -Path $CredentialDir -Force | Out-Null
+    }
+
+    $cred = Get-Credential -Message "Zugangsdaten fuer Tab '$Name'"
+    if (-Not $cred) {
+        Write-Log "Eingabe abgebrochen - es wurden keine Zugangsdaten gespeichert." 'WARN'
+        return
+    }
+
+    $path = Get-CredentialPath -Name $Name
+    $cred | Export-Clixml -Path $path
+    Write-Log "Zugangsdaten fuer '$Name' verschluesselt gespeichert: $path"
+    Write-Log "Das Feld 'Pw' fuer diesen Tab kann jetzt aus settings.json entfernt werden." 'WARN'
+}
+
+function Get-TabCredential {
+    <#
+        Liefert @{ Username = ...; Password = ... } oder $null.
+
+        Reihenfolge: verschluesselte Datei zuerst, danach als
+        Uebergangsloesung das Klartextfeld aus settings.json - dann aber mit
+        deutlicher Warnung, damit die Migration nicht liegen bleibt.
+    #>
+    Param(
+        [Parameter(Mandatory = $true)]
+        [String]$Name,
+        [AllowEmptyString()][String]$FallbackUsername = "",
+        [AllowEmptyString()][String]$FallbackPassword = ""
+    )
+
+    $path = Get-CredentialPath -Name $Name
+    if (Test-Path -LiteralPath $path) {
+        try {
+            $cred = Import-Clixml -Path $path
+            return @{
+                Username = $cred.UserName
+                Password = $cred.GetNetworkCredential().Password
+            }
+        }
+        catch {
+            Write-Log "Zugangsdaten fuer '$Name' konnten nicht entschluesselt werden: $($_.Exception.Message)" 'WARN'
+            Write-Log "Haeufigste Ursache: Die Datei wurde unter einem anderen Benutzerkonto oder auf einem anderen Rechner erzeugt. Mit -SetCredential '$Name' neu anlegen." 'WARN'
+        }
+    }
+
+    if (-Not [string]::IsNullOrEmpty($FallbackPassword)) {
+        Write-Log "Tab '$Name' nutzt noch das Klartext-Passwort aus settings.json. Bitte einmalig '.\AppSupervisorAndBrowserCycle.ps1 -SetCredential ""$Name""' ausfuehren und das Feld 'Pw' danach leeren." 'WARN'
+        return @{ Username = $FallbackUsername; Password = $FallbackPassword }
+    }
+
+    return $null
+}
 
 function Get-OpenedTabsState {
     <#
@@ -190,10 +353,37 @@ function New-DefaultSettings {
             [ordered]@{ Name = "Notepad++";  Path = "C:\Program Files\Notepad++\notepad++.exe" }
             [ordered]@{ Name = "HD Witness"; Path = "C:\Program Files\Network Optix\Nx Witness\Client\6.1.2.42921\HD Witness.exe" }
         )
+        timings       = [ordered]@{
+            # Zeitfenster, das ein Skriptlauf abdecken soll. Der Standard 3540
+            # entspricht 59 Minuten und setzt voraus, dass der Task Scheduler
+            # stuendlich startet. Bei kuerzerem Trigger entsprechend senken.
+            cycleWindowSeconds        = 3540
+            # Obergrenze fuer den Vollbild-Rundlauf, unabhaengig von Intervall
+            # und Fensteranzahl. 0 = keine Begrenzung.
+            fullscreenHardStopSeconds = 120
+            # Aufbewahrung der Logdateien in Tagen. 0 = nie loeschen.
+            logRetentionDays          = 30
+        }
+        # Wird von Setup-KioskMachine.ps1 gelesen, nicht von diesem Skript.
+        kioskSetup    = [ordered]@{
+            taskIntervalMinutes = 5
+            nightlyRebootTime   = "04:30"
+        }
         browserCycle  = [ordered]@{
             waitSeconds                     = 30
             closeExtraBrowserWindows        = $true
             fullscreenCycleIntervalSeconds  = 60
+            # Schalter fuer den Edge-Start. Ohne diese bleibt nach einem
+            # Stromausfall der Dialog "Seiten wiederherstellen?" stehen und
+            # die Anzeige haengt, bis jemand mit der Maus hingeht.
+            browserArguments                = @(
+                "--noerrdialogs"
+                "--disable-session-crashed-bubble"
+                "--no-first-run"
+                "--no-default-browser-check"
+                "--disable-infobars"
+                "--lang=de-DE"
+            )
             tabs                            = @(
                 [ordered]@{
                     Active        = $true
@@ -204,8 +394,10 @@ function New-DefaultSettings {
                     TabNameUnsafe = ""
                     Login         = $false
                     TabNameLogin  = ""
+                    # Kein "Pw" mehr: Das Passwort wird verschluesselt abgelegt
+                    # (-SetCredential), der Benutzername darf hier stehen
+                    # bleiben, wird aber ebenfalls mitgespeichert.
                     Username      = ""
-                    Pw            = ""
                 }
             )
         }
@@ -238,6 +430,36 @@ catch {
     Write-Host "Original-Fehlermeldung:" -ForegroundColor Yellow
     Write-Host $_.Exception.Message
     throw "Abbruch: settings.json ist ungueltig. Bitte Pfade pruefen (doppelte Backslashes) und erneut starten."
+}
+
+# ------------------------------------------------------------
+# Zeiten aus der Konfiguration (mit Rueckfallwerten, falls der
+# Abschnitt "timings" in einer aelteren settings.json noch fehlt)
+# ------------------------------------------------------------
+function Get-IntSetting {
+    Param(
+        $Value,
+        [Parameter(Mandatory = $true)][int]$Default,
+        [int]$Minimum = 0
+    )
+    if ($null -eq $Value) { return $Default }
+    try { $parsed = [int]$Value } catch { return $Default }
+    if ($parsed -lt $Minimum) { return $Default }
+    return $parsed
+}
+
+$CycleWindowSeconds        = Get-IntSetting $Settings.timings.cycleWindowSeconds        3540 1
+$HardStopFullscreenSeconds = Get-IntSetting $Settings.timings.fullscreenHardStopSeconds 120  0
+$LogRetentionDays          = Get-IntSetting $Settings.timings.logRetentionDays          30   0
+
+Remove-OldLogs -RetentionDays $LogRetentionDays
+
+# ------------------------------------------------------------
+# Sondermodus: Zugangsdaten ablegen und beenden
+# ------------------------------------------------------------
+if ($SetCredential) {
+    Set-TabCredential -Name $SetCredential
+    return
 }
 
 # ------------------------------------------------------------
@@ -628,7 +850,11 @@ function OpenUrlAndLogin {
     }
     else {
         Write-Log "Kein Edge-Fenster aktiv. Oeffne neues Fenster fuer '$Name'."
-        Start-Process -FilePath "msedge.exe" -ArgumentList "--new-window --lanf=de-DE $URL"
+        # $script:BrowserArguments kommt aus browserCycle.browserArguments und
+        # unterdrueckt u.a. den Dialog "Seiten wiederherstellen?", der nach
+        # einem Stromausfall sonst auf der Anzeige stehen bleibt.
+        $edgeArgs = @("--new-window") + $script:BrowserArguments + @($URL)
+        Start-Process -FilePath "msedge.exe" -ArgumentList $edgeArgs
     }
 
     $count = 0
@@ -975,14 +1201,12 @@ function CicleTabs {
 # ============================================================
 
 # ------------------------------------------------------------
-# SICHERHEITS-HARDSTOP (hartcodiert, NICHT ueber settings.json
-# veraenderbar): Der komplette Vollbild-Rundlauf darf zur
-# Absicherung aktuell nicht laenger als 2 Minuten laufen, egal
-# wie "fullscreenCycleIntervalSeconds" oder die Anzahl Fenster
-# konfiguriert ist. Sobald das Verhalten im produktiven Betrieb
-# final geprueft ist, kann dieser Wert erhoeht/entfernt werden.
+# SICHERHEITS-HARDSTOP aus timings.fullscreenHardStopSeconds:
+# Obergrenze fuer den kompletten Vollbild-Rundlauf, unabhaengig von
+# "fullscreenCycleIntervalSeconds" und der Anzahl Fenster. 0 hebt die
+# Begrenzung auf.
 # ------------------------------------------------------------
-$script:HardStopFullscreenCycleSeconds = 120
+$script:HardStopFullscreenCycleSeconds = $HardStopFullscreenSeconds
 
 function Test-IsForegroundWindow {
     <#
@@ -1115,9 +1339,9 @@ function Invoke-FullscreenCycle {
         zwischen den Wechseln.
 
         SICHERHEITS-HARDSTOP: Die Gesamtlaufzeit dieser Funktion ist hart auf
-        $script:HardStopFullscreenCycleSeconds (aktuell 2 Minuten) begrenzt,
-        unabhaengig von Intervall/Fensteranzahl. Nach Ablauf wird der Rundlauf
-        sauber beendet und geloggt.
+        timings.fullscreenHardStopSeconds begrenzt, unabhaengig von
+        Intervall und Fensteranzahl. Nach Ablauf wird der Rundlauf sauber
+        beendet und geloggt. Der Wert 0 hebt die Begrenzung auf.
     #>
     Param(
         [Parameter(Mandatory = $true)]
@@ -1151,29 +1375,42 @@ function Invoke-FullscreenCycle {
         return
     }
 
-    Write-Log "Vollbild-Rundlauf gestartet: $($targets.Count) Fenster referenziert, Intervall = $IntervalSeconds Sekunden, Hardstop = $script:HardStopFullscreenCycleSeconds Sekunden."
+    # 0 bedeutet laut Konfiguration "keine Begrenzung" - ohne diese
+    # Unterscheidung wuerde der Vergleich "verstrichen >= 0" sofort zutreffen
+    # und der Rundlauf waere nach dem ersten Fenster vorbei.
+    $hardStop = $script:HardStopFullscreenCycleSeconds
+    $limited  = ($hardStop -gt 0)
+
+    if ($limited) {
+        Write-Log "Vollbild-Rundlauf gestartet: $($targets.Count) Fenster referenziert, Intervall = $IntervalSeconds Sekunden, Hardstop = $hardStop Sekunden."
+    }
+    else {
+        Write-Log "Vollbild-Rundlauf gestartet: $($targets.Count) Fenster referenziert, Intervall = $IntervalSeconds Sekunden, ohne Hardstop."
+    }
 
     $startTime = Get-Date
     $index = 0
 
     while ($true) {
-        $elapsed = (Get-Date) - $startTime
-        if ($elapsed.TotalSeconds -ge $script:HardStopFullscreenCycleSeconds) {
-            Write-Log "Vollbild-Rundlauf: Sicherheits-Hardstop von $script:HardStopFullscreenCycleSeconds Sekunden erreicht - Rundlauf wird beendet." 'WARN'
+        if ($limited -and ((Get-Date) - $startTime).TotalSeconds -ge $hardStop) {
+            Write-Log "Vollbild-Rundlauf: Sicherheits-Hardstop von $hardStop Sekunden erreicht - Rundlauf wird beendet." 'WARN'
             break
         }
 
         $target = $targets[$index % $targets.Count]
         Set-WindowFullscreen -Process $target.Process -Label $target.Label
 
-        # Restzeit bis zum Hardstop beruecksichtigen, damit die letzte Wartezeit
-        # nicht ueber den Hardstop hinaus laeuft.
-        $remaining = $script:HardStopFullscreenCycleSeconds - ((Get-Date) - $startTime).TotalSeconds
-        $sleepSeconds = [Math]::Min($IntervalSeconds, [Math]::Max(0, $remaining))
+        $sleepSeconds = $IntervalSeconds
+        if ($limited) {
+            # Restzeit beruecksichtigen, damit die letzte Wartezeit nicht ueber
+            # den Hardstop hinaus laeuft.
+            $remaining = $hardStop - ((Get-Date) - $startTime).TotalSeconds
+            $sleepSeconds = [Math]::Min($IntervalSeconds, [Math]::Max(0, $remaining))
 
-        if ($sleepSeconds -le 0) {
-            Write-Log "Vollbild-Rundlauf: Hardstop erreicht waehrend der Wartezeit - Rundlauf wird beendet." 'WARN'
-            break
+            if ($sleepSeconds -le 0) {
+                Write-Log "Vollbild-Rundlauf: Hardstop erreicht waehrend der Wartezeit - Rundlauf wird beendet." 'WARN'
+                break
+            }
         }
 
         Start-Sleep -Seconds $sleepSeconds
@@ -1207,6 +1444,19 @@ function Invoke-BrowserCycle {
     } catch { $FullscreenCycleIntervalSeconds = 60 }
     if ($FullscreenCycleIntervalSeconds -le 0) { $FullscreenCycleIntervalSeconds = 60 }
 
+    # Kiosk-Schalter fuer den Edge-Start. Fehlt der Eintrag in einer aelteren
+    # settings.json, greifen die Standardwerte.
+    $script:BrowserArguments = @(
+        "--noerrdialogs"
+        "--disable-session-crashed-bubble"
+        "--no-first-run"
+        "--no-default-browser-check"
+        "--disable-infobars"
+    )
+    if ($BrowserCycleSettings.browserArguments) {
+        $script:BrowserArguments = @($BrowserCycleSettings.browserArguments)
+    }
+
     [Object]$pss = @()
 
     # Persistenten Tab-State laden (ueberlebt Skript-Neustarts, solange Edge laeuft)
@@ -1225,9 +1475,27 @@ function Invoke-BrowserCycle {
             try { $Login = [System.Convert]::ToBoolean($a.Login) } catch { $Login = $false }
 
             if ($Active) {
-                Write-Host $a.Name
-                $pss += OpenUrlAndLogin -name $a.Name -url $a.URL -TabName $a.TabName -ThisIsUnsafe $ThisIsUnsafe -TabNameUnsafe $a.TabNameUnsafe -Login $Login -TabNameLogin $a.TabNameLogin -Username $a.Username -Pw $a.Pw -OpenedTabsState $OpenedTabsState
-                Write-Host ''
+                Write-Log "Verarbeite Tab '$($a.Name)'."
+
+                # Zugangsdaten erst hier aufloesen: bevorzugt verschluesselt
+                # aus .\state\credentials, sonst als Uebergang aus der
+                # settings.json. Ohne Treffer wird der Login uebersprungen
+                # statt mit leeren Feldern ins Formular zu tippen.
+                $tabUser = ""
+                $tabPw   = ""
+                if ($Login) {
+                    $cred = Get-TabCredential -Name $a.Name -FallbackUsername $a.Username -FallbackPassword $a.Pw
+                    if ($cred) {
+                        $tabUser = $cred.Username
+                        $tabPw   = $cred.Password
+                    }
+                    else {
+                        Write-Log "Fuer '$($a.Name)' ist Login aktiviert, es sind aber keine Zugangsdaten hinterlegt - der Login wird uebersprungen. Anlegen mit: .\AppSupervisorAndBrowserCycle.ps1 -SetCredential ""$($a.Name)""" 'WARN'
+                        $Login = $false
+                    }
+                }
+
+                $pss += OpenUrlAndLogin -name $a.Name -url $a.URL -TabName $a.TabName -ThisIsUnsafe $ThisIsUnsafe -TabNameUnsafe $a.TabNameUnsafe -Login $Login -TabNameLogin $a.TabNameLogin -Username $tabUser -Pw $tabPw -OpenedTabsState $OpenedTabsState
             }
         }
 
@@ -1238,19 +1506,18 @@ function Invoke-BrowserCycle {
         # NEU: Vollbild-Rundlauf ueber alle referenzierten Browserfenster
         # UND ueberwachten Programme, gesteuert ueber
         # "fullscreenCycleIntervalSeconds" aus settings.json.
-        # Zur Absicherung aktuell hart auf max. 2 Minuten begrenzt
-        # (siehe $script:HardStopFullscreenCycleSeconds).
+        # Begrenzt durch timings.fullscreenHardStopSeconds.
         # ------------------------------------------------------------
         Invoke-FullscreenCycle -BrowserWindows $pss -MonitoredApps $MonitoredApps -IntervalSeconds $FullscreenCycleIntervalSeconds
 
-        # Berechnung der Wiederholungen anhand der Sekunden pro 59 Min und
-        # Wartezeit. Die 3540 setzen voraus, dass der Task Scheduler dieses
-        # Skript stuendlich neu startet.
-        $repeater = [int](3540 / $wait / $CountActive)
+        # Wie viele Durchgaenge in das konfigurierte Zeitfenster passen
+        # (timings.cycleWindowSeconds, Standard 3540 = 59 Minuten). Der Wert
+        # muss zum Trigger-Intervall der Aufgabenplanung passen.
+        $repeater = [int]($CycleWindowSeconds / $wait / $CountActive)
         if ($repeater -lt 1) {
             # Bei grossen waitSeconds ergibt die Ganzzahldivision 0 - der
             # Rundlauf haette dann stillschweigend gar nicht stattgefunden.
-            Write-Log "Berechnete Durchgaenge waren $repeater (waitSeconds=$wait, aktive Tabs=$CountActive). Es wird mindestens ein Durchgang ausgefuehrt; fuer die volle Stunde muss waitSeconds kleiner sein." 'WARN'
+            Write-Log "Berechnete Durchgaenge waren $repeater (cycleWindowSeconds=$CycleWindowSeconds, waitSeconds=$wait, aktive Tabs=$CountActive). Es wird mindestens ein Durchgang ausgefuehrt; fuer das volle Zeitfenster muss waitSeconds kleiner sein." 'WARN'
             $repeater = 1
         }
         CicleTabs -pss $pss -repeater $repeater -wait $wait

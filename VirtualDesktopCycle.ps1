@@ -65,6 +65,23 @@
 
     Konfiguration: .\config\settings.json, Abschnitt "virtualDesktopCycle".
 
+    ZEITEN (alle in settings.json, keine fest verdrahteten Werte mehr):
+      intervalSeconds         Standzeit je Desktop im Rundlauf.
+      maxRuntimeSeconds       Gesamtlaufzeit, 0 = endlos (siehe STOPPEN).
+      desktopSwitchDelayMs    Wartezeit nach einem Desktop-Wechsel. Die
+                              Umschaltung ist animiert - ist der Wert zu
+                              klein, faellt der naechste Hotkey in die
+                              laufende Animation und wird verschluckt. Auf
+                              traeger Hardware erhoehen.
+      windowTimeoutSeconds    Wartezeit auf das Fenster eines gestarteten Ziels.
+      fullscreenDelaySeconds  Pause zwischen "Fenster ist da" und dem F11-Druck.
+      logRetentionDays        Aufbewahrung der Logdateien, 0 = nie loeschen.
+
+    BROWSER-SCHALTER (browserArguments): Ziele vom Typ "Url" werden mit
+      diesen Schaltern gestartet. Ohne sie bleibt nach einem Stromausfall der
+      Dialog "Seiten wiederherstellen?" stehen und die Anzeige haengt, bis
+      jemand mit der Maus hingeht.
+
     STOPPEN: Mit maxRuntimeSeconds = 0 laeuft der Rundlauf endlos. Zum
     geordneten Beenden eine Datei "stop.txt" neben das Skript legen - sie wird
     beim naechsten Taktwechsel erkannt (also nach spaetestens
@@ -89,6 +106,32 @@ if (-Not (Test-Path $LogDir)) {
     New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
 }
 $LogFile = Join-Path $LogDir ("VirtualDesktopCycle_" + (Get-Date -Format "yyyyMMdd") + ".log")
+
+function Remove-OldLogs {
+    <#
+        Loescht Logdateien, die aelter als $RetentionDays sind. Pro Tag
+        entsteht eine Datei; im 24/7-Betrieb sammeln die sich sonst ueber
+        Jahre an. RetentionDays = 0 schaltet das Aufraeumen ab.
+    #>
+    Param([Parameter(Mandatory = $true)][int]$RetentionDays)
+
+    if ($RetentionDays -le 0) { return }
+
+    $limit = (Get-Date).AddDays(-$RetentionDays)
+    try {
+        $old = @(Get-ChildItem -Path $LogDir -Filter "VirtualDesktopCycle_*.log" -File -ErrorAction Stop |
+                 Where-Object { $_.LastWriteTime -lt $limit })
+        foreach ($file in $old) {
+            Remove-Item -LiteralPath $file.FullName -Force -ErrorAction SilentlyContinue
+        }
+        if ($old.Count -gt 0) {
+            Write-Log "Log-Aufraeumen: $($old.Count) Datei(en) aelter als $RetentionDays Tage entfernt."
+        }
+    }
+    catch {
+        Write-Log "Log-Aufraeumen fehlgeschlagen: $($_.Exception.Message)" 'WARN'
+    }
+}
 
 function Write-Log {
     Param(
@@ -120,6 +163,26 @@ function New-DefaultVirtualDesktopSettings {
             resetDesktopsOnStart = $false
             restartForPlacement  = $false
             maxRuntimeSeconds    = 300
+            # Wartezeit nach einem Desktop-Wechsel. Die Umschaltung ist
+            # animiert; ist der Wert zu klein, faellt der naechste Hotkey in
+            # die laufende Animation und wird verschluckt. Auf traeger
+            # Hardware ggf. erhoehen.
+            desktopSwitchDelayMs = 700
+            # Wie lange auf das Fenster eines gestarteten Ziels gewartet wird.
+            windowTimeoutSeconds = 30
+            # Pause zwischen "Fenster ist da" und dem F11-Tastendruck.
+            fullscreenDelaySeconds = 2
+            # Aufbewahrung der Logdateien in Tagen. 0 = nie loeschen.
+            logRetentionDays     = 30
+            # Schalter fuer den Edge-Start bei Zielen vom Typ "Url".
+            browserArguments     = @(
+                "--noerrdialogs"
+                "--disable-session-crashed-bubble"
+                "--no-first-run"
+                "--no-default-browser-check"
+                "--disable-infobars"
+                "--lang=de-DE"
+            )
             targets              = @(
                 [ordered]@{
                     Active = $true
@@ -211,6 +274,38 @@ function ConvertTo-BoolSetting {
 [bool]$UseFullscreen        = ConvertTo-BoolSetting $VdConfig.fullscreen $true
 [bool]$ResetDesktopsOnStart = ConvertTo-BoolSetting $VdConfig.resetDesktopsOnStart $false
 [bool]$RestartForPlacement  = ConvertTo-BoolSetting $VdConfig.restartForPlacement $false
+
+function Get-IntSetting {
+    Param(
+        $Value,
+        [Parameter(Mandatory = $true)][int]$Default,
+        [int]$Minimum = 0
+    )
+    if ($null -eq $Value) { return $Default }
+    try { $parsed = [int]$Value } catch { return $Default }
+    if ($parsed -lt $Minimum) { return $Default }
+    return $parsed
+}
+
+$DesktopSwitchDelayMs   = Get-IntSetting $VdConfig.desktopSwitchDelayMs   700 50
+$WindowTimeoutSeconds   = Get-IntSetting $VdConfig.windowTimeoutSeconds   30  1
+$FullscreenDelaySeconds = Get-IntSetting $VdConfig.fullscreenDelaySeconds 2   0
+$LogRetentionDays       = Get-IntSetting $VdConfig.logRetentionDays       30  0
+
+Remove-OldLogs -RetentionDays $LogRetentionDays
+
+# Kiosk-Schalter fuer Ziele vom Typ "Url". Fehlt der Eintrag in einer
+# aelteren settings.json, greifen die Standardwerte.
+$BrowserArguments = @(
+    "--noerrdialogs"
+    "--disable-session-crashed-bubble"
+    "--no-first-run"
+    "--no-default-browser-check"
+    "--disable-infobars"
+)
+if ($VdConfig.browserArguments) {
+    $BrowserArguments = @($VdConfig.browserArguments)
+}
 
 $Targets = @($VdConfig.targets | Where-Object { $_.Active -eq $true })
 
@@ -321,10 +416,10 @@ function Get-ForegroundProcessId {
 # Backend "Hotkey": Desktops per Tastenkuerzel
 # ============================================================
 
-# Die Desktop-Umschaltung ist animiert. Zu kurze Wartezeiten fuehren dazu,
-# dass der naechste Hotkey in die laufende Animation faellt und verschluckt
-# wird. 700 ms sind auf traegerer Hardware erfahrungsgemaess noetig.
-$script:DesktopSwitchDelayMs = 700
+# Aus der Konfiguration (desktopSwitchDelayMs). Die Desktop-Umschaltung ist
+# animiert; zu kurze Wartezeiten fuehren dazu, dass der naechste Hotkey in die
+# laufende Animation faellt und verschluckt wird.
+$script:DesktopSwitchDelayMs = $DesktopSwitchDelayMs
 
 function Switch-DesktopRight {
     Send-WinCtrlHotkey -VirtualKey ([VdInterop]::VK_RIGHT) -Extended
@@ -563,8 +658,7 @@ function Start-TargetOnCurrentDesktop {
         Rueckgabe: der gestartete Prozess oder $null.
     #>
     Param(
-        [Parameter(Mandatory = $true)][Object]$Target,
-        [int]$WindowTimeoutSeconds = 30
+        [Parameter(Mandatory = $true)][Object]$Target
     )
 
     $arguments = @()
@@ -575,7 +669,11 @@ function Start-TargetOnCurrentDesktop {
             Write-Log "Ziel '$($Target.Name)': Typ 'Url', aber es ist keine URL konfiguriert - wird uebersprungen." 'WARN'
             return $null
         }
+        # Die Kiosk-Schalter unterdruecken u.a. den Dialog "Seiten
+        # wiederherstellen?", der nach einem Stromausfall sonst auf der
+        # Anzeige stehen bleibt und einen Mausklick braucht.
         $arguments += "--new-window"
+        $arguments += $script:BrowserArguments
         $arguments += $Target.URL
         $filePath = "msedge.exe"
     }
@@ -602,7 +700,7 @@ function Start-TargetOnCurrentDesktop {
 
     # Auf das Hauptfenster warten. Refresh() ist zwingend - MainWindowHandle
     # wird im Prozessobjekt zwischengespeichert und bleibt sonst dauerhaft 0.
-    $deadline = (Get-Date).AddSeconds($WindowTimeoutSeconds)
+    $deadline = (Get-Date).AddSeconds($script:WindowTimeoutSeconds)
     while ((Get-Date) -lt $deadline) {
         Start-Sleep -Milliseconds 500
         try {
@@ -626,7 +724,7 @@ function Start-TargetOnCurrentDesktop {
         return $fallback
     }
 
-    Write-Log "Ziel '$($Target.Name)': Innerhalb von $WindowTimeoutSeconds Sekunden ist kein Fenster erschienen." 'WARN'
+    Write-Log "Ziel '$($Target.Name)': Innerhalb von $script:WindowTimeoutSeconds Sekunden ist kein Fenster erschienen." 'WARN'
     return $null
 }
 
@@ -641,7 +739,7 @@ function Set-TargetFullscreen {
     # Vordergrund - es muss also kein Fokus erkaempft werden. Zur Sicherheit
     # wird das trotzdem geprueft, bevor F11 rausgeht: sonst landet der
     # Tastendruck im falschen Fenster.
-    Start-Sleep -Seconds 2
+    Start-Sleep -Seconds $script:FullscreenDelaySeconds
     $foregroundPid = Get-ForegroundProcessId
 
     if ($foregroundPid -eq $Process.Id) {
